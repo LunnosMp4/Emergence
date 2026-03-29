@@ -6,7 +6,7 @@ import time
 import pygame
 
 from src.config import *
-from src.entities import Carnivore, Food, Mote, load_sprite_frames
+from src.entities import Carnivore, Food, Mote, PheromoneField, load_sprite_frames
 from src.metrics.logger import MetricsLogger, MetricsSnapshot
 
 
@@ -61,6 +61,13 @@ class Simulation:
         self._adaptive_trigger_counter = 0
         self._adaptive_active_frames = 0
         self._adaptive_cooldown_frames = 0
+        self.pheromone_field = PheromoneField(max_markers=PHEROMONE_MAX_MARKERS)
+        self.communication_debug_draw = PHEROMONE_DEBUG_DRAW_DEFAULT
+        self._distress_emit_cooldown_frames = 0
+        self.relay_events_since_sample = 0
+        self.distress_events_since_sample = 0
+        self.last_sample_relay_events = 0
+        self.last_sample_alert_events = 0
 
         self.overlay_font = pygame.font.Font(None, 22)
         self.graph_title_font = pygame.font.Font(None, 22)
@@ -75,6 +82,9 @@ class Simulation:
             len(self.carnivores),
             self.ecosystem_stress_index,
             self.adaptive_mode_active,
+            active_signals=self.pheromone_field.active_count(),
+            relay_events=self.last_sample_relay_events,
+            alert_events=self.last_sample_alert_events,
         )
         self._update_graph_surface()
         self._collect_and_log_metrics()
@@ -139,6 +149,299 @@ class Simulation:
         except (pygame.error, OSError) as exc:
             print(f"Warning: failed to load background texture ({background_path}): {exc}")
             self.background_surface = None
+
+    def _update_communication_state(self):
+        if not COMMUNICATION_ENABLED:
+            return
+
+        self.pheromone_field.tick()
+        if self._distress_emit_cooldown_frames > 0:
+            self._distress_emit_cooldown_frames -= 1
+
+    def _emit_communication_event(
+        self,
+        x,
+        y,
+        intensity,
+        marker_type,
+        max_age_frames,
+        use_cooldown=False,
+        species_tag=None,
+    ):
+        if not COMMUNICATION_ENABLED:
+            return False
+
+        if use_cooldown and self._distress_emit_cooldown_frames > 0:
+            return False
+
+        emitted = self.pheromone_field.emit(
+            x,
+            y,
+            intensity,
+            marker_type,
+            max_age_frames,
+            species_tag=species_tag,
+        )
+        if emitted:
+            self.distress_events_since_sample += 1
+            if use_cooldown:
+                self._distress_emit_cooldown_frames = max(1, PHEROMONE_EMIT_COOLDOWN_FRAMES // 2)
+
+        return emitted
+
+    def _draw_communication_debug(self):
+        if not COMMUNICATION_ENABLED or not self.communication_debug_draw:
+            return
+
+        markers = self.pheromone_field.iter_markers()
+        if not markers:
+            return
+
+        layer = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
+        type_color = {
+            "alarm": (80, 175, 255),
+            "relay": (118, 255, 160),
+            "distress": (255, 190, 95),
+            "kill_site": (255, 95, 95),
+            "mate": (214, 174, 255),
+        }
+
+        for marker in markers:
+            freshness = marker.freshness
+            alpha = max(18, int(PHEROMONE_DEBUG_ALPHA * freshness))
+            radius = max(
+                PHEROMONE_DEBUG_RADIUS_MIN,
+                int(PHEROMONE_DEBUG_RADIUS_SCALE * marker.intensity * max(0.35, freshness)),
+            )
+            base_color = type_color.get(marker.marker_type, (170, 210, 255))
+            if marker.marker_type == "mate":
+                if marker.species_tag == "prey":
+                    base_color = (104, 230, 255)
+                elif marker.species_tag == "predator":
+                    base_color = (255, 188, 96)
+            draw_color = (base_color[0], base_color[1], base_color[2], alpha)
+
+            center = (int(marker.x), int(marker.y))
+            pygame.draw.circle(layer, draw_color, center, radius, 1)
+            pygame.draw.circle(layer, draw_color, center, 2)
+
+        self.screen.blit(layer, (0, 0))
+
+    def _interrupt_entity_mating(self, entity, failed=True):
+        if not SEXUAL_REPRODUCTION_ENABLED or entity is None:
+            return
+
+        partner = getattr(entity, "mate_partner", None)
+
+        entity.mate_partner = None
+        entity.mating_progress_frames = 0
+        if failed:
+            entity.reproduction_state = "COOLDOWN"
+            entity.reproduction_cooldown = max(
+                entity.reproduction_cooldown,
+                getattr(entity, "failed_mating_cooldown_frames", 0),
+            )
+        elif entity.reproduction_state == "MATING":
+            entity.reproduction_state = "IDLE"
+
+        if partner is not None and getattr(partner, "mate_partner", None) is entity:
+            partner.mate_partner = None
+            partner.mating_progress_frames = 0
+            if failed:
+                partner.reproduction_state = "COOLDOWN"
+                partner.reproduction_cooldown = max(
+                    partner.reproduction_cooldown,
+                    getattr(partner, "failed_mating_cooldown_frames", 0),
+                )
+            elif partner.reproduction_state == "MATING":
+                partner.reproduction_state = "IDLE"
+
+    def _complete_mating_pair(self, first, second):
+        for entity in (first, second):
+            entity.energy = max(0.0, entity.energy - entity.mating_energy_cost)
+            entity.mate_partner = None
+            entity.mating_progress_frames = 0
+            entity.reproduction_state = "COOLDOWN"
+            entity.reproduction_cooldown = max(
+                entity.reproduction_cooldown,
+                entity.reproduction_cooldown_frames,
+            )
+
+    def _spawn_child_from_pair(self, first, second, species):
+        child_x = (first.x + second.x) * 0.5
+        child_y = (first.y + second.y) * 0.5
+
+        if species == "prey":
+            child_speed = max(
+                MOTE_MIN_SPEED,
+                ((first.speed + second.speed) * 0.5) + random.uniform(*MOTE_SPEED_MUTATION_RANGE),
+            )
+            child_vision = max(
+                MOTE_MIN_VISION,
+                ((first.vision_radius + second.vision_radius) * 0.5) + random.uniform(*MOTE_VISION_MUTATION_RANGE),
+            )
+            child_size = ((first.size + second.size) * 0.5) * (
+                1.0 + random.uniform(-PREY_SIZE_MUTATION_RATIO, PREY_SIZE_MUTATION_RATIO)
+            )
+            child_size = max(PREY_MIN_SIZE, min(PREY_MAX_SIZE, child_size))
+
+            return Mote(
+                child_x,
+                child_y,
+                speed=child_speed,
+                vision=child_vision,
+                size=child_size,
+                energy=PREY_MATE_CHILD_ENERGY,
+                generation=max(first.generation, second.generation) + 1,
+            )
+
+        if species == "predator":
+            child_speed = max(
+                CARNIVORE_MIN_SPEED,
+                min(
+                    CARNIVORE_MAX_SPEED,
+                    ((first.speed + second.speed) * 0.5) + random.uniform(*CARNIVORE_SPEED_MUTATION_RANGE),
+                ),
+            )
+            child_vision = max(
+                CARNIVORE_MIN_VISION,
+                min(
+                    CARNIVORE_MAX_VISION,
+                    ((first.vision_radius + second.vision_radius) * 0.5)
+                    + random.uniform(*CARNIVORE_VISION_MUTATION_RANGE),
+                ),
+            )
+            child_size = ((first.size + second.size) * 0.5) * (
+                1.0 + random.uniform(-CARNIVORE_SIZE_MUTATION_RATIO, CARNIVORE_SIZE_MUTATION_RATIO)
+            )
+            child_size = max(CARNIVORE_MIN_SIZE, min(CARNIVORE_MAX_SIZE, child_size))
+
+            child = Carnivore(
+                child_x,
+                child_y,
+                speed=child_speed,
+                vision=child_vision,
+                size=child_size,
+                energy=PREDATOR_MATE_CHILD_ENERGY,
+                generation=max(first.generation, second.generation) + 1,
+            )
+            child.reproduction_cooldown = max(1, PREDATOR_REPRODUCTION_COOLDOWN_FRAMES // 2)
+            child.reproduction_state = "COOLDOWN"
+            return child
+
+        return None
+
+    def _update_species_mating(self, entities, species):
+        if not SEXUAL_REPRODUCTION_ENABLED:
+            return []
+
+        children = []
+        entity_set = set(entities)
+
+        for entity in entities:
+            partner = entity.mate_partner
+            if partner is None:
+                if entity.reproduction_state == "MATING":
+                    self._interrupt_entity_mating(entity, failed=True)
+                continue
+
+            if partner not in entity_set or partner.energy <= 0 or partner.mate_partner is not entity:
+                self._interrupt_entity_mating(entity, failed=True)
+
+        for entity in entities:
+            if entity.reproduction_state != "SEEK_MATE" or entity.mate_partner is not None:
+                continue
+
+            if species == "predator" and len(entities) + len(children) >= MAX_CARNIVORES:
+                break
+
+            nearest_partner = None
+            min_dist = entity.mate_search_radius
+
+            for candidate in entities:
+                if candidate is entity:
+                    continue
+                if candidate.reproduction_state != "SEEK_MATE" or candidate.mate_partner is not None:
+                    continue
+                if not entity.can_pair_with(candidate):
+                    continue
+
+                dist = math.hypot(candidate.x - entity.x, candidate.y - entity.y)
+                if dist < min_dist:
+                    min_dist = dist
+                    nearest_partner = candidate
+
+            if nearest_partner is None:
+                continue
+
+            touch_distance = entity.mate_touch_distance + nearest_partner.mate_touch_distance
+            if min_dist > touch_distance:
+                continue
+
+            entity.mate_partner = nearest_partner
+            nearest_partner.mate_partner = entity
+            entity.reproduction_state = "MATING"
+            nearest_partner.reproduction_state = "MATING"
+            entity.mating_progress_frames = 0
+            nearest_partner.mating_progress_frames = 0
+
+        processed_pairs = set()
+        for entity in entities:
+            if entity.reproduction_state != "MATING":
+                continue
+
+            partner = entity.mate_partner
+            if partner is None or partner not in entity_set:
+                self._interrupt_entity_mating(entity, failed=True)
+                continue
+
+            pair_key = tuple(sorted((id(entity), id(partner))))
+            if pair_key in processed_pairs:
+                continue
+            processed_pairs.add(pair_key)
+
+            if partner.reproduction_state != "MATING" or partner.mate_partner is not entity:
+                self._interrupt_entity_mating(entity, failed=True)
+                continue
+
+            dx = partner.x - entity.x
+            dy = partner.y - entity.y
+            dist = math.hypot(dx, dy)
+            touch_distance = entity.mate_touch_distance + partner.mate_touch_distance
+
+            mid_x = (entity.x + partner.x) * 0.5
+            mid_y = (entity.y + partner.y) * 0.5
+
+            if dist > 1e-6:
+                ux = dx / dist
+                uy = dy / dist
+                desired_sep = min(touch_distance * 0.6, max(2.0, touch_distance * 0.25))
+                entity.x = max(0.0, min(WIDTH, mid_x - (ux * desired_sep * 0.5)))
+                entity.y = max(0.0, min(HEIGHT, mid_y - (uy * desired_sep * 0.5)))
+                partner.x = max(0.0, min(WIDTH, mid_x + (ux * desired_sep * 0.5)))
+                partner.y = max(0.0, min(HEIGHT, mid_y + (uy * desired_sep * 0.5)))
+
+            progress = max(entity.mating_progress_frames, partner.mating_progress_frames) + 1
+            entity.mating_progress_frames = progress
+            partner.mating_progress_frames = progress
+
+            required_frames = max(entity.mating_duration_frames, partner.mating_duration_frames)
+            if progress < required_frames:
+                continue
+
+            if species == "predator" and len(entities) + len(children) >= MAX_CARNIVORES:
+                self._interrupt_entity_mating(entity, failed=True)
+                continue
+
+            child = self._spawn_child_from_pair(entity, partner, species)
+            if child is None:
+                self._interrupt_entity_mating(entity, failed=True)
+                continue
+
+            children.append(child)
+            self._complete_mating_pair(entity, partner)
+
+        return children
 
     def _compute_ecosystem_stress(self):
         prey_count = len(self.motes)
@@ -304,6 +607,7 @@ class Simulation:
         population = len(self.motes)
         food_count = len(self.foods)
         carnivore_population = len(self.carnivores)
+        active_signals = self.pheromone_field.active_count() if COMMUNICATION_ENABLED else 0
 
         total_speed = 0.0
         total_vision = 0.0
@@ -366,6 +670,11 @@ class Simulation:
         if len(self.metrics_history) > GRAPH_HISTORY_POINTS:
             del self.metrics_history[: len(self.metrics_history) - GRAPH_HISTORY_POINTS]
 
+        self.last_sample_relay_events = self.relay_events_since_sample
+        self.last_sample_alert_events = self.distress_events_since_sample
+        self.relay_events_since_sample = 0
+        self.distress_events_since_sample = 0
+
         self._update_overlay_text(
             elapsed_seconds,
             population,
@@ -373,6 +682,9 @@ class Simulation:
             carnivore_population,
             self.ecosystem_stress_index,
             self.adaptive_mode_active,
+            active_signals=active_signals,
+            relay_events=self.last_sample_relay_events,
+            alert_events=self.last_sample_alert_events,
         )
         self._update_graph_surface()
 
@@ -384,12 +696,17 @@ class Simulation:
         carnivore_count,
         ecosystem_stress=0.0,
         adaptive_mode=False,
+        active_signals=0,
+        relay_events=0,
+        alert_events=0,
     ):
         runtime_text = time.strftime("%H:%M:%S", time.gmtime(elapsed_seconds))
         adaptive_label = "ON" if adaptive_mode else "OFF"
+        comm_debug_label = "ON" if self.communication_debug_draw else "OFF"
         overlay_text = (
             f"{runtime_text} | Prey: {population} | Pred: {carnivore_count} | "
-            f"Food: {food_count} | Stress: {ecosystem_stress:.2f} | Aid: {adaptive_label}"
+            f"Food: {food_count} | Sig: {active_signals} | Relay: {relay_events} | "
+            f"Alert: {alert_events} | Stress: {ecosystem_stress:.2f} | Aid: {adaptive_label} | ComDbg: {comm_debug_label}"
         )
         self.overlay_text_surface = self.overlay_font.render(overlay_text, True, OVERLAY_TEXT_COLOR)
         self.overlay_bg_surface = pygame.Surface(
@@ -556,6 +873,7 @@ class Simulation:
         try:
             while self.running:
                 self._update_adaptive_mode()
+                self._update_communication_state()
 
                 if self.background_surface is not None:
                     self.screen.blit(self.background_surface, (0, 0))
@@ -565,6 +883,8 @@ class Simulation:
                 for event in pygame.event.get():
                     if event.type == pygame.QUIT:
                         self.running = False
+                    elif event.type == pygame.KEYDOWN and event.key == pygame.K_v:
+                        self.communication_debug_draw = not self.communication_debug_draw
 
                 food_spawn_chance = FOOD_SPAWN_CHANCE
                 if ADAPTIVE_BALANCING_ENABLED and self.adaptive_mode_active:
@@ -584,12 +904,17 @@ class Simulation:
 
                 if ENABLE_PREDATORS:
                     for carnivore in self.carnivores:
-                        carnivore.update(self.motes)
+                        carnivore.update(
+                            self.motes,
+                            self.carnivores if SEXUAL_REPRODUCTION_ENABLED else None,
+                            pheromone_field=self.pheromone_field if COMMUNICATION_ENABLED else None,
+                        )
 
                         if ADAPTIVE_BALANCING_ENABLED and self.adaptive_mode_active:
                             carnivore.energy -= ADAPTIVE_PREDATOR_DRAIN_BONUS
 
                         if carnivore.energy <= 0:
+                            self._interrupt_entity_mating(carnivore, failed=True)
                             continue
 
                         colliding_mote = None
@@ -605,6 +930,17 @@ class Simulation:
                                 closest_dist = dist
                                 colliding_mote = mote
 
+                        if colliding_mote is not None:
+                            self._emit_communication_event(
+                                colliding_mote.x,
+                                colliding_mote.y,
+                                PHEROMONE_DISTRESS_INTENSITY,
+                                "distress",
+                                PHEROMONE_DISTRESS_MAX_AGE_FRAMES,
+                                use_cooldown=True,
+                                species_tag="prey",
+                            )
+
                         if (
                             colliding_mote is not None
                             and carnivore.attack_cooldown <= 0
@@ -615,10 +951,19 @@ class Simulation:
                                 if ADAPTIVE_BALANCING_ENABLED and self.adaptive_mode_active:
                                     energy_reward *= ADAPTIVE_KILL_REWARD_MULT
 
+                                self._interrupt_entity_mating(colliding_mote, failed=True)
                                 consumed_mote_ids.add(id(colliding_mote))
                                 carnivore.energy = min(
                                     CARNIVORE_MAX_ENERGY,
                                     carnivore.energy + energy_reward,
+                                )
+                                self._emit_communication_event(
+                                    colliding_mote.x,
+                                    colliding_mote.y,
+                                    PHEROMONE_KILLSITE_INTENSITY,
+                                    "kill_site",
+                                    PHEROMONE_KILLSITE_MAX_AGE_FRAMES,
+                                    species_tag="prey",
                                 )
                                 carnivore.on_successful_hunt(colliding_mote)
                                 carnivore.attack_cooldown = max(
@@ -630,53 +975,6 @@ class Simulation:
                                 carnivore.on_failed_attack(colliding_mote)
                                 carnivore.attack_cooldown = CARNIVORE_ATTACK_COOLDOWN_FRAMES
 
-                        active_predator_count = len(alive_carnivores) + len(new_carnivores) + 1
-                        remaining_prey = max(0, len(self.motes) - len(consumed_mote_ids))
-                        prey_ratio = remaining_prey / max(1, active_predator_count)
-                        required_prey_ratio = CARNIVORE_MIN_PREY_PER_PREDATOR
-                        if ADAPTIVE_BALANCING_ENABLED and self.adaptive_mode_active:
-                            required_prey_ratio *= ADAPTIVE_REPRODUCTION_GATE_MULT
-
-                        if (
-                            carnivore.energy >= CARNIVORE_REPRODUCTION_THRESHOLD
-                            and carnivore.reproduction_cooldown <= 0
-                            and active_predator_count < MAX_CARNIVORES
-                            and prey_ratio >= required_prey_ratio
-                        ):
-                            carnivore.energy = CARNIVORE_POST_REPRODUCTION_ENERGY
-                            carnivore.reproduction_cooldown = CARNIVORE_REPRODUCTION_COOLDOWN_FRAMES
-
-                            mutated_speed = max(
-                                CARNIVORE_MIN_SPEED,
-                                min(
-                                    CARNIVORE_MAX_SPEED,
-                                    carnivore.speed + random.uniform(*CARNIVORE_SPEED_MUTATION_RANGE),
-                                ),
-                            )
-                            mutated_vision = max(
-                                CARNIVORE_MIN_VISION,
-                                min(
-                                    CARNIVORE_MAX_VISION,
-                                    carnivore.vision_radius + random.uniform(*CARNIVORE_VISION_MUTATION_RANGE),
-                                ),
-                            )
-                            mutated_size = carnivore.size * (
-                                1.0 + random.uniform(-CARNIVORE_SIZE_MUTATION_RATIO, CARNIVORE_SIZE_MUTATION_RATIO)
-                            )
-                            mutated_size = max(CARNIVORE_MIN_SIZE, min(CARNIVORE_MAX_SIZE, mutated_size))
-
-                            child = Carnivore(
-                                carnivore.x,
-                                carnivore.y,
-                                speed=mutated_speed,
-                                vision=mutated_vision,
-                                size=mutated_size,
-                                energy=CARNIVORE_OFFSPRING_ENERGY,
-                                generation=carnivore.generation + 1,
-                            )
-                            child.reproduction_cooldown = CARNIVORE_REPRODUCTION_COOLDOWN_FRAMES // 2
-                            new_carnivores.append(child)
-
                         if carnivore.energy > 0:
                             alive_carnivores.append(carnivore)
 
@@ -686,9 +984,17 @@ class Simulation:
                     if id(mote) in consumed_mote_ids:
                         continue
 
-                    mote.update(self.foods, active_carnivores)
+                    communication_events = mote.update(
+                        self.foods,
+                        active_carnivores,
+                        pheromone_field=self.pheromone_field if COMMUNICATION_ENABLED else None,
+                        nearby_motes=self.motes,
+                    )
+                    if communication_events and communication_events.get("relay_emitted"):
+                        self.relay_events_since_sample += 1
 
                     if mote.energy <= 0:
+                        self._interrupt_entity_mating(mote, failed=True)
                         continue
 
                     for food in self.foods[:]:
@@ -700,27 +1006,13 @@ class Simulation:
                             mote.energy += food.energy_value
                             self.foods.remove(food)
 
-                    if mote.energy >= MOTE_REPRODUCTION_THRESHOLD:
-                        mote.energy = MOTE_POST_REPRODUCTION_ENERGY
-                        mutated_speed = max(MOTE_MIN_SPEED, mote.speed + random.uniform(*MOTE_SPEED_MUTATION_RANGE))
-                        mutated_vision = max(MOTE_MIN_VISION, mote.vision_radius + random.uniform(*MOTE_VISION_MUTATION_RANGE))
-                        mutated_size = mote.size * (
-                            1.0 + random.uniform(-PREY_SIZE_MUTATION_RATIO, PREY_SIZE_MUTATION_RATIO)
-                        )
-                        mutated_size = max(PREY_MIN_SIZE, min(PREY_MAX_SIZE, mutated_size))
-                        child = Mote(
-                            mote.x,
-                            mote.y,
-                            speed=mutated_speed,
-                            vision=mutated_vision,
-                            size=mutated_size,
-                            energy=MOTE_POST_REPRODUCTION_ENERGY,
-                            generation=mote.generation + 1,
-                        )
-                        new_motes.append(child)
-
                     alive_motes.append(mote)
                     mote.draw(self.screen)
+
+                if SEXUAL_REPRODUCTION_ENABLED:
+                    new_motes.extend(self._update_species_mating(alive_motes, "prey"))
+                    if ENABLE_PREDATORS:
+                        new_carnivores.extend(self._update_species_mating(alive_carnivores, "predator"))
 
                 self.motes = alive_motes + new_motes
                 if ENABLE_PREDATORS:
@@ -730,6 +1022,8 @@ class Simulation:
 
                 for carnivore in self.carnivores:
                     carnivore.draw(self.screen)
+
+                self._draw_communication_debug()
 
                 self.frame_count += 1
 
