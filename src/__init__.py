@@ -1,0 +1,1 @@
+"""Project Mote source package."""

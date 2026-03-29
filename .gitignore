@@ -1,0 +1,6 @@
+__pycache__/
+metrics.csv
+.vscode/
+.venv/
+path/
+PROJECT_PLAN.md
