@@ -28,13 +28,17 @@ from src.config import (
 
 
 class Mote:
-    sprite_frames = []
+    sprite_variants = []
     sprite_cache = {}
 
     @classmethod
-    def set_sprite_frames(cls, frames):
-        cls.sprite_frames = frames
+    def set_sprite_variants(cls, variants):
+        cls.sprite_variants = [frames for frames in variants if frames]
         cls.sprite_cache = {}
+
+    @classmethod
+    def set_sprite_frames(cls, frames):
+        cls.set_sprite_variants([frames] if frames else [])
 
     def __init__(
         self,
@@ -68,6 +72,9 @@ class Mote:
         # Color used only if sprite loading fails.
         color_val = max(50, min(255, int((self.speed / 4.0) * 255)))
         self.color = (color_val, 50, 255 - color_val)
+        self.sprite_variant_index = 0
+        if type(self).sprite_variants:
+            self.sprite_variant_index = random.randrange(len(type(self).sprite_variants))
 
     def _radius_from_size(self, size):
         return max(3, int(PREY_RADIUS_BASE + (size * PREY_RADIUS_SCALE)))
@@ -84,19 +91,30 @@ class Mote:
     def _current_velocity_magnitude(self):
         return math.hypot(self.vx, self.vy)
 
+    def _get_active_frames(self):
+        variants = type(self).sprite_variants
+        if not variants:
+            return []
+
+        if self.sprite_variant_index >= len(variants):
+            self.sprite_variant_index = 0
+
+        return variants[self.sprite_variant_index]
+
     def _update_facing_angle(self):
         if self._current_velocity_magnitude() >= SPRITE_MOVING_SPEED_THRESHOLD:
             self.facing_angle = math.degrees(math.atan2(-self.vy, self.vx))
 
     def _get_animation_frame_index(self):
-        if not type(self).sprite_frames:
+        frames = self._get_active_frames()
+        if not frames:
             return 0
 
         if self._current_velocity_magnitude() < SPRITE_MOVING_SPEED_THRESHOLD:
             return 0
 
         elapsed = pygame.time.get_ticks()
-        return (elapsed // SPRITE_ANIMATION_FRAME_MS) % len(type(self).sprite_frames)
+        return (elapsed // SPRITE_ANIMATION_FRAME_MS) % len(frames)
 
     def _get_threat_vector(self, carnivores):
         if not carnivores:
@@ -203,6 +221,8 @@ class Mote:
         closest = None
         min_dist = self.vision_radius
         for food in foods:
+            if hasattr(food, "is_grown") and not food.is_grown():
+                continue
             dist = math.hypot(food.x - self.x, food.y - self.y)
             if dist < min_dist:
                 min_dist = dist
@@ -210,7 +230,8 @@ class Mote:
         return closest
 
     def draw(self, surface):
-        if not type(self).sprite_frames:
+        frames = self._get_active_frames()
+        if not frames:
             pygame.draw.circle(surface, self.color, (int(self.x), int(self.y)), self.radius)
             return
 
@@ -218,11 +239,11 @@ class Mote:
         frame_index = self._get_animation_frame_index()
         sprite_size = max(MOTE_MIN_SPRITE_SIZE_PX, int(self.radius * 2 * SPRITE_RENDER_SCALE))
         snapped_angle = int(round(self.facing_angle / SPRITE_ROTATION_STEP_DEGREES) * SPRITE_ROTATION_STEP_DEGREES)
-        cache_key = (frame_index, sprite_size, snapped_angle)
+        cache_key = (self.sprite_variant_index, frame_index, sprite_size, snapped_angle)
 
         sprite = type(self).sprite_cache.get(cache_key)
         if sprite is None:
-            source = type(self).sprite_frames[frame_index]
+            source = frames[frame_index]
             scaled = pygame.transform.scale(source, (sprite_size, sprite_size))
             sprite = pygame.transform.rotate(scaled, snapped_angle + MOTE_SPRITE_HEADING_OFFSET_DEGREES)
             type(self).sprite_cache[cache_key] = sprite

@@ -79,15 +79,50 @@ class Simulation:
         self._update_graph_surface()
         self._collect_and_log_metrics()
 
-    def _load_sprite_assets(self):
-        mote_sheet = os.path.join(PROJECT_ROOT, MOTE_SPRITESHEET_PATH)
-        carnivore_sheet = os.path.join(PROJECT_ROOT, CARNIVORE_SPRITESHEET_PATH)
+    def _load_sprite_variants_from_directory(self, relative_directory, label):
+        directory_path = os.path.join(PROJECT_ROOT, relative_directory)
+        variants = []
 
         try:
-            Mote.set_sprite_frames(load_sprite_frames(mote_sheet))
-        except (pygame.error, OSError) as exc:
-            print(f"Warning: failed to load mote spritesheet ({mote_sheet}): {exc}")
-            Mote.set_sprite_frames([])
+            directory_entries = sorted(os.listdir(directory_path))
+        except OSError as exc:
+            print(f"Warning: failed to list {label} sprite directory ({directory_path}): {exc}")
+            return variants
+
+        for entry_name in directory_entries:
+            if not entry_name.lower().endswith(SPRITE_FILE_EXTENSIONS):
+                continue
+
+            sprite_sheet_path = os.path.join(directory_path, entry_name)
+            if not os.path.isfile(sprite_sheet_path):
+                continue
+
+            try:
+                variants.append(load_sprite_frames(sprite_sheet_path))
+            except (pygame.error, OSError) as exc:
+                print(f"Warning: failed to load {label} spritesheet ({sprite_sheet_path}): {exc}")
+
+        if not variants:
+            print(f"Warning: no valid {label} spritesheets found in {directory_path}")
+
+        return variants
+
+    def _load_sprite_assets(self):
+        carnivore_sheet = os.path.join(PROJECT_ROOT, CARNIVORE_SPRITESHEET_PATH)
+        fallback_mote_sheet = os.path.join(PROJECT_ROOT, MOTE_SPRITESHEET_PATH)
+
+        prey_variants = self._load_sprite_variants_from_directory(PREY_SPRITES_DIR, "prey")
+        if prey_variants:
+            Mote.set_sprite_variants(prey_variants)
+        else:
+            try:
+                Mote.set_sprite_frames(load_sprite_frames(fallback_mote_sheet))
+            except (pygame.error, OSError) as exc:
+                print(f"Warning: failed to load fallback prey spritesheet ({fallback_mote_sheet}): {exc}")
+                Mote.set_sprite_frames([])
+
+        crop_variants = self._load_sprite_variants_from_directory(CROP_SPRITES_DIR, "crop")
+        Food.set_sprite_variants(crop_variants)
 
         try:
             Carnivore.set_sprite_frames(load_sprite_frames(carnivore_sheet))
@@ -657,6 +692,9 @@ class Simulation:
                         continue
 
                     for food in self.foods[:]:
+                        if not food.is_grown():
+                            continue
+
                         dist = math.hypot(food.x - mote.x, food.y - mote.y)
                         if dist < mote.radius + food.radius:
                             mote.energy += food.energy_value
