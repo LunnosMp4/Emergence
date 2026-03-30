@@ -16,6 +16,7 @@ class Simulation:
         self.screen = pygame.display.set_mode((WIDTH, HEIGHT))
         pygame.display.set_caption("Mote Ecosystem V1")
         self.clock = pygame.time.Clock()
+        self.scene_surface = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA).convert_alpha()
         self.background_surface = None
         self._load_background_asset()
         self._load_sprite_assets()
@@ -68,6 +69,17 @@ class Simulation:
         self.distress_events_since_sample = 0
         self.last_sample_relay_events = 0
         self.last_sample_alert_events = 0
+
+        self._mote_age_frames = {id(mote): 0 for mote in self.motes}
+        self._carnivore_age_frames = {id(carnivore): 0 for carnivore in self.carnivores}
+
+        self.camera_mode = "map"
+        self.camera_target = None
+        self.camera_target_species = None
+        self.camera_shot_frames_remaining = 0
+        self.camera_center_x = WIDTH * 0.5
+        self.camera_center_y = HEIGHT * 0.5
+        self.camera_zoom = CAMERA_MAP_ZOOM
 
         self.overlay_font = pygame.font.Font(None, 22)
         self.graph_title_font = pygame.font.Font(None, 22)
@@ -189,9 +201,12 @@ class Simulation:
 
         return emitted
 
-    def _draw_communication_debug(self):
+    def _draw_communication_debug(self, target_surface=None):
         if not COMMUNICATION_ENABLED or not self.communication_debug_draw:
             return
+
+        if target_surface is None:
+            target_surface = self.screen
 
         markers = self.pheromone_field.iter_markers()
         if not markers:
@@ -225,7 +240,200 @@ class Simulation:
             pygame.draw.circle(layer, draw_color, center, radius, 1)
             pygame.draw.circle(layer, draw_color, center, 2)
 
-        self.screen.blit(layer, (0, 0))
+        target_surface.blit(layer, (0, 0))
+
+    def _refresh_entity_age_maps(self):
+        updated_mote_ages = {}
+        for mote in self.motes:
+            mote_id = id(mote)
+            updated_mote_ages[mote_id] = self._mote_age_frames.get(mote_id, -1) + 1
+        self._mote_age_frames = updated_mote_ages
+
+        updated_carnivore_ages = {}
+        for carnivore in self.carnivores:
+            carnivore_id = id(carnivore)
+            updated_carnivore_ages[carnivore_id] = self._carnivore_age_frames.get(carnivore_id, -1) + 1
+        self._carnivore_age_frames = updated_carnivore_ages
+
+    def _get_camera_shot_duration(self, min_frames, max_frames):
+        low = max(1, int(min_frames))
+        high = max(1, int(max_frames))
+        if high < low:
+            low, high = high, low
+        return random.randint(low, high)
+
+    def _pick_camera_subject(self, candidates, age_map):
+        if not candidates:
+            return None
+
+        pool = candidates
+        if self.camera_target is not None and len(candidates) > 1:
+            filtered = [entity for entity in candidates if entity is not self.camera_target]
+            if filtered:
+                pool = filtered
+
+        weights = [max(1, age_map.get(id(entity), 0)) for entity in pool]
+        return random.choices(pool, weights=weights, k=1)[0]
+
+    def _choose_next_camera_shot(self, force_map=False):
+        if not CAMERA_DIRECTOR_ENABLED:
+            self.camera_mode = "map"
+            self.camera_target = None
+            self.camera_target_species = None
+            self.camera_shot_frames_remaining = 0
+            return
+
+        eligible_prey = [
+            mote
+            for mote in self.motes
+            if mote.energy > 0 and self._mote_age_frames.get(id(mote), 0) >= CAMERA_SUBJECT_MIN_AGE_FRAMES
+        ]
+        eligible_predators = [
+            carnivore
+            for carnivore in self.carnivores
+            if carnivore.energy > 0
+            and self._carnivore_age_frames.get(id(carnivore), 0) >= CAMERA_SUBJECT_MIN_AGE_FRAMES
+        ]
+
+        should_pick_map = (
+            force_map
+            or (not eligible_prey and not eligible_predators)
+            or random.random() < CAMERA_MAP_FOCUS_WEIGHT
+        )
+        if should_pick_map:
+            self.camera_mode = "map"
+            self.camera_target = None
+            self.camera_target_species = None
+            self.camera_shot_frames_remaining = self._get_camera_shot_duration(
+                CAMERA_MAP_SHOT_MIN_FRAMES,
+                CAMERA_MAP_SHOT_MAX_FRAMES,
+            )
+            return
+
+        choose_prey = False
+        if eligible_prey and eligible_predators:
+            choose_prey = random.random() < CAMERA_PREY_SUBJECT_WEIGHT
+        elif eligible_prey:
+            choose_prey = True
+
+        if choose_prey:
+            target = self._pick_camera_subject(eligible_prey, self._mote_age_frames)
+            target_species = "prey"
+            target_mode = "prey"
+        else:
+            target = self._pick_camera_subject(eligible_predators, self._carnivore_age_frames)
+            target_species = "predator"
+            target_mode = "predator"
+
+        if target is None:
+            self.camera_mode = "map"
+            self.camera_target = None
+            self.camera_target_species = None
+            self.camera_shot_frames_remaining = self._get_camera_shot_duration(
+                CAMERA_MAP_SHOT_MIN_FRAMES,
+                CAMERA_MAP_SHOT_MAX_FRAMES,
+            )
+            return
+
+        self.camera_mode = target_mode
+        self.camera_target = target
+        self.camera_target_species = target_species
+        self.camera_shot_frames_remaining = self._get_camera_shot_duration(
+            CAMERA_SUBJECT_SHOT_MIN_FRAMES,
+            CAMERA_SUBJECT_SHOT_MAX_FRAMES,
+        )
+
+    def _camera_target_is_valid(self):
+        if self.camera_target is None or self.camera_target_species is None:
+            return False
+
+        if self.camera_target_species == "prey":
+            return self.camera_target in self.motes and self.camera_target.energy > 0
+
+        if self.camera_target_species == "predator":
+            return self.camera_target in self.carnivores and self.camera_target.energy > 0
+
+        return False
+
+    def _update_camera_director(self):
+        if not CAMERA_DIRECTOR_ENABLED:
+            self.camera_mode = "map"
+            self.camera_target = None
+            self.camera_target_species = None
+            self.camera_center_x = WIDTH * 0.5
+            self.camera_center_y = HEIGHT * 0.5
+            self.camera_zoom = CAMERA_MAP_ZOOM
+            return
+
+        if self.camera_shot_frames_remaining <= 0:
+            self._choose_next_camera_shot()
+        else:
+            self.camera_shot_frames_remaining -= 1
+
+        if self.camera_mode != "map" and not self._camera_target_is_valid():
+            self._choose_next_camera_shot(force_map=True)
+
+        desired_center_x = WIDTH * 0.5
+        desired_center_y = HEIGHT * 0.5
+        desired_zoom = CAMERA_MAP_ZOOM
+
+        if self.camera_mode == "prey" and self._camera_target_is_valid():
+            desired_center_x = self.camera_target.x
+            desired_center_y = self.camera_target.y
+            desired_zoom = CAMERA_PREY_ZOOM
+        elif self.camera_mode == "predator" and self._camera_target_is_valid():
+            desired_center_x = self.camera_target.x
+            desired_center_y = self.camera_target.y
+            desired_zoom = CAMERA_PREDATOR_ZOOM
+
+        self.camera_center_x += (desired_center_x - self.camera_center_x) * CAMERA_FOLLOW_LERP
+        self.camera_center_y += (desired_center_y - self.camera_center_y) * CAMERA_FOLLOW_LERP
+        self.camera_zoom += (desired_zoom - self.camera_zoom) * CAMERA_ZOOM_LERP
+        self.camera_zoom = max(CAMERA_MIN_ZOOM, min(CAMERA_MAX_ZOOM, self.camera_zoom))
+
+        view_width = WIDTH / max(1e-6, self.camera_zoom)
+        view_height = HEIGHT / max(1e-6, self.camera_zoom)
+        half_w = view_width * 0.5
+        half_h = view_height * 0.5
+
+        if half_w >= WIDTH * 0.5:
+            self.camera_center_x = WIDTH * 0.5
+        else:
+            self.camera_center_x = max(half_w, min(WIDTH - half_w, self.camera_center_x))
+
+        if half_h >= HEIGHT * 0.5:
+            self.camera_center_y = HEIGHT * 0.5
+        else:
+            self.camera_center_y = max(half_h, min(HEIGHT - half_h, self.camera_center_y))
+
+    def _render_camera_view(self, source_surface):
+        if not CAMERA_DIRECTOR_ENABLED:
+            self.screen.blit(source_surface, (0, 0))
+            return
+
+        zoom = max(CAMERA_MIN_ZOOM, self.camera_zoom)
+        if zoom <= 1.01:
+            self.screen.blit(source_surface, (0, 0))
+            return
+
+        view_w = max(1, int(WIDTH / zoom))
+        view_h = max(1, int(HEIGHT / zoom))
+        if view_w >= WIDTH and view_h >= HEIGHT:
+            self.screen.blit(source_surface, (0, 0))
+            return
+
+        left = int(round(self.camera_center_x - (view_w * 0.5)))
+        top = int(round(self.camera_center_y - (view_h * 0.5)))
+        left = max(0, min(left, WIDTH - view_w))
+        top = max(0, min(top, HEIGHT - view_h))
+
+        view_rect = pygame.Rect(left, top, view_w, view_h)
+        cropped = source_surface.subsurface(view_rect).copy()
+        if CAMERA_USE_SMOOTHSCALE:
+            scaled = pygame.transform.smoothscale(cropped, (WIDTH, HEIGHT))
+        else:
+            scaled = pygame.transform.scale(cropped, (WIDTH, HEIGHT))
+        self.screen.blit(scaled, (0, 0))
 
     def _interrupt_entity_mating(self, entity, failed=True):
         if not SEXUAL_REPRODUCTION_ENABLED or entity is None:
@@ -874,11 +1082,15 @@ class Simulation:
             while self.running:
                 self._update_adaptive_mode()
                 self._update_communication_state()
+                self._refresh_entity_age_maps()
+
+                scene_surface = self.scene_surface
+                scene_surface.fill((0, 0, 0, 255))
 
                 if self.background_surface is not None:
-                    self.screen.blit(self.background_surface, (0, 0))
+                    scene_surface.blit(self.background_surface, (0, 0))
                 else:
-                    self.screen.fill(BG_COLOR)
+                    scene_surface.fill(BG_COLOR)
 
                 for event in pygame.event.get():
                     if event.type == pygame.QUIT:
@@ -894,7 +1106,7 @@ class Simulation:
                     self.foods.append(Food())
 
                 for food in self.foods:
-                    food.draw(self.screen)
+                    food.draw(scene_surface)
 
                 new_motes = []
                 alive_motes = []
@@ -1007,7 +1219,7 @@ class Simulation:
                             self.foods.remove(food)
 
                     alive_motes.append(mote)
-                    mote.draw(self.screen)
+                    mote.draw(scene_surface)
 
                 if SEXUAL_REPRODUCTION_ENABLED:
                     new_motes.extend(self._update_species_mating(alive_motes, "prey"))
@@ -1021,9 +1233,12 @@ class Simulation:
                     self.carnivores = []
 
                 for carnivore in self.carnivores:
-                    carnivore.draw(self.screen)
+                    carnivore.draw(scene_surface)
 
-                self._draw_communication_debug()
+                self._draw_communication_debug(scene_surface)
+
+                self._update_camera_director()
+                self._render_camera_view(scene_surface)
 
                 self.frame_count += 1
 
