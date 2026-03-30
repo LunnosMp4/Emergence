@@ -1,12 +1,17 @@
+import json
 import math
 import os
 import random
+import subprocess
+import threading
 import time
+from urllib.parse import urlencode
+from urllib.request import urlopen
 
 import pygame
 
 from src.config import *
-from src.entities import Carnivore, Food, Mote, PheromoneField, load_sprite_frames
+from src.entities import Carnivore, Food, Mote, PheromoneField, SSHWarden, SteamGiant, load_sprite_frames
 from src.metrics.logger import MetricsLogger, MetricsSnapshot
 
 
@@ -42,6 +47,26 @@ class Simulation:
                 )
                 for _ in range(INITIAL_CARNIVORE_COUNT)
             ]
+        self.steam_giants = []
+        if ENABLE_STEAM_ENTITY:
+            self.steam_giants = [
+                SteamGiant(
+                    random.randint(0, WIDTH),
+                    random.randint(0, HEIGHT),
+                )
+                for _ in range(INITIAL_STEAM_ENTITY_COUNT)
+            ]
+
+        self.ssh_wardens = []
+        if ENABLE_SSH_ENTITY:
+            self.ssh_wardens = [
+                SSHWarden(
+                    random.randint(0, WIDTH),
+                    random.randint(0, HEIGHT),
+                )
+                for _ in range(INITIAL_SSH_ENTITY_COUNT)
+            ]
+
         self.running = True
 
         self.metrics_logger = MetricsLogger(
@@ -70,6 +95,13 @@ class Simulation:
         self.last_sample_relay_events = 0
         self.last_sample_alert_events = 0
 
+        self._presence_lock = threading.Lock()
+        self._presence_stop_event = threading.Event()
+        self._presence_thread = None
+        self._steam_is_playing = False
+        self._steam_state_text = "Idle"
+        self._ssh_session_count = 0
+
         self._mote_age_frames = {id(mote): 0 for mote in self.motes}
         self._carnivore_age_frames = {id(carnivore): 0 for carnivore in self.carnivores}
 
@@ -82,24 +114,37 @@ class Simulation:
         self.camera_center_y = HEIGHT * 0.5
         self.camera_zoom = CAMERA_MAP_ZOOM
 
-        self.overlay_font = pygame.font.Font(None, 22)
-        self.graph_title_font = pygame.font.Font(None, 22)
-        self.graph_legend_font = pygame.font.Font(None, 16)
+        self.overlay_font = None
+        self.graph_title_font = None
+        self.graph_legend_font = None
         self.overlay_text_surface = None
         self.overlay_bg_surface = None
         self.graph_surface = None
-        self._update_overlay_text(
-            0.0,
-            len(self.motes),
-            len(self.foods),
-            len(self.carnivores),
-            self.ecosystem_stress_index,
-            self.adaptive_mode_active,
-            active_signals=self.pheromone_field.active_count(),
-            relay_events=self.last_sample_relay_events,
-            alert_events=self.last_sample_alert_events,
-        )
-        self._update_graph_surface()
+        if METRICS_HUD_ENABLED:
+            self.overlay_font = pygame.font.Font(None, 22)
+            if METRICS_GRAPH_ENABLED:
+                self.graph_title_font = pygame.font.Font(None, 22)
+                self.graph_legend_font = pygame.font.Font(None, 16)
+
+            self._update_overlay_text(
+                0.0,
+                len(self.motes),
+                len(self.foods),
+                len(self.carnivores),
+                self.ecosystem_stress_index,
+                self.adaptive_mode_active,
+                active_signals=self.pheromone_field.active_count(),
+                relay_events=self.last_sample_relay_events,
+                alert_events=self.last_sample_alert_events,
+                steam_special_count=len(self.steam_giants),
+                ssh_special_count=len(self.ssh_wardens),
+            )
+            if METRICS_GRAPH_ENABLED:
+                self._update_graph_surface()
+
+        if PRESENCE_POLLING_ENABLED:
+            self._start_presence_poller()
+
         self._collect_and_log_metrics()
 
     def _load_sprite_variants_from_directory(self, relative_directory, label):
@@ -133,6 +178,8 @@ class Simulation:
     def _load_sprite_assets(self):
         carnivore_sheet = os.path.join(PROJECT_ROOT, CARNIVORE_SPRITESHEET_PATH)
         fallback_mote_sheet = os.path.join(PROJECT_ROOT, MOTE_SPRITESHEET_PATH)
+        steam_sheet = os.path.join(PROJECT_ROOT, STEAM_ENTITY_SPRITESHEET_PATH)
+        ssh_sheet = os.path.join(PROJECT_ROOT, SSH_ENTITY_SPRITESHEET_PATH)
 
         prey_variants = self._load_sprite_variants_from_directory(PREY_SPRITES_DIR, "prey")
         if prey_variants:
@@ -153,6 +200,18 @@ class Simulation:
             print(f"Warning: failed to load carnivore spritesheet ({carnivore_sheet}): {exc}")
             Carnivore.set_sprite_frames([])
 
+        try:
+            SteamGiant.set_sprite_frames(load_sprite_frames(steam_sheet))
+        except (pygame.error, OSError) as exc:
+            print(f"Warning: failed to load steam entity spritesheet ({steam_sheet}): {exc}")
+            SteamGiant.set_sprite_frames([])
+
+        try:
+            SSHWarden.set_sprite_frames(load_sprite_frames(ssh_sheet))
+        except (pygame.error, OSError) as exc:
+            print(f"Warning: failed to load ssh entity spritesheet ({ssh_sheet}): {exc}")
+            SSHWarden.set_sprite_frames([])
+
     def _load_background_asset(self):
         background_path = os.path.join(PROJECT_ROOT, BACKGROUND_TEXTURE_PATH)
 
@@ -162,6 +221,147 @@ class Simulation:
         except (pygame.error, OSError) as exc:
             print(f"Warning: failed to load background texture ({background_path}): {exc}")
             self.background_surface = None
+
+    def _spawn_steam_giant(self):
+        return SteamGiant(
+            random.randint(0, WIDTH),
+            random.randint(0, HEIGHT),
+        )
+
+    def _spawn_ssh_warden(self):
+        return SSHWarden(
+            random.randint(0, WIDTH),
+            random.randint(0, HEIGHT),
+        )
+
+    def _start_presence_poller(self):
+        if self._presence_thread and self._presence_thread.is_alive():
+            return
+
+        self._presence_stop_event.clear()
+        self._presence_thread = threading.Thread(target=self._presence_loop, name="presence-poller", daemon=True)
+        self._presence_thread.start()
+
+    def _presence_loop(self):
+        next_steam_poll = 0.0
+        next_ssh_poll = 0.0
+
+        while not self._presence_stop_event.is_set():
+            now = time.monotonic()
+
+            if now >= next_steam_poll:
+                self._poll_presence()
+                next_steam_poll = now + max(1.0, float(STEAM_POLL_INTERVAL_SECONDS))
+
+            if now >= next_ssh_poll:
+                self._poll_ssh_sessions()
+                next_ssh_poll = now + max(1.0, float(SSH_POLL_INTERVAL_SECONDS))
+
+            self._presence_stop_event.wait(max(0.05, float(PRESENCE_THREAD_SLEEP_SECONDS)))
+
+    def _poll_presence(self):
+        state_text = "Idle"
+        is_playing = False
+
+        if not STEAM_API_KEY or not STEAM_ID64:
+            with self._presence_lock:
+                self._steam_is_playing = False
+                self._steam_state_text = "Idle"
+            return
+
+        try:
+            query = urlencode({"key": STEAM_API_KEY, "steamids": STEAM_ID64})
+            url = f"http://api.steampowered.com/ISteamUser/GetPlayerSummaries/v0002/?{query}"
+            with urlopen(url, timeout=float(STEAM_REQUEST_TIMEOUT_SECONDS)) as response:
+                if response.status != 200:
+                    raise RuntimeError(f"Steam API status {response.status}")
+
+                data = json.loads(response.read().decode("utf-8"))
+
+            players = data.get("response", {}).get("players", [])
+            if players:
+                player = players[0]
+                game_id = player.get("gameid")
+                game_extra_info = player.get("gameextrainfo")
+                if game_id and game_extra_info:
+                    is_playing = True
+                    state_text = f"Playing: {game_extra_info}"
+        except Exception:
+            state_text = "Idle"
+            is_playing = False
+
+        with self._presence_lock:
+            self._steam_is_playing = is_playing
+            self._steam_state_text = state_text
+
+    def _poll_ssh_sessions(self):
+        session_count = 0
+
+        try:
+            result = subprocess.run(
+                ["who"],
+                capture_output=True,
+                text=True,
+                timeout=2.0,
+                check=False,
+            )
+            if result.returncode == 0:
+                for line in result.stdout.splitlines():
+                    columns = line.split()
+                    if len(columns) < 2:
+                        continue
+
+                    tty_name = columns[1]
+                    if not tty_name.startswith("pts/"):
+                        continue
+
+                    remote_host = ""
+                    if "(" in line and ")" in line:
+                        remote_host = line.rsplit("(", 1)[-1].split(")", 1)[0].strip()
+
+                    remote_host_lc = remote_host.lower()
+                    if remote_host and remote_host_lc not in {"localhost", "127.0.0.1", "::1", ":0"}:
+                        session_count += 1
+
+            if session_count == 0:
+                fallback = subprocess.run(
+                    ["ps", "-axo", "command"],
+                    capture_output=True,
+                    text=True,
+                    timeout=2.0,
+                    check=False,
+                )
+                if fallback.returncode == 0:
+                    for command in fallback.stdout.splitlines():
+                        if "sshd:" in command and "@pts/" in command:
+                            session_count += 1
+        except Exception:
+            session_count = 0
+
+        with self._presence_lock:
+            self._ssh_session_count = max(0, min(int(session_count), int(SSH_ENTITY_MAX_COUNT)))
+
+    def _sync_special_entities_from_presence(self):
+        if not PRESENCE_POLLING_ENABLED:
+            return
+
+        with self._presence_lock:
+            steam_playing = self._steam_is_playing
+            ssh_sessions = self._ssh_session_count
+
+        if ENABLE_STEAM_ENTITY:
+            target_steam_count = 1 if steam_playing else 0
+            while len(self.steam_giants) < target_steam_count:
+                self.steam_giants.append(self._spawn_steam_giant())
+            if len(self.steam_giants) > target_steam_count:
+                del self.steam_giants[target_steam_count:]
+
+        if ENABLE_SSH_ENTITY:
+            target_ssh_count = max(0, min(int(ssh_sessions), int(SSH_ENTITY_MAX_COUNT)))
+            while len(self.ssh_wardens) < target_ssh_count:
+                self.ssh_wardens.append(self._spawn_ssh_warden())
+            if len(self.ssh_wardens) > target_ssh_count:
+                del self.ssh_wardens[target_ssh_count:]
 
     def _update_communication_state(self):
         if not COMMUNICATION_ENABLED:
@@ -902,18 +1102,24 @@ class Simulation:
         self.relay_events_since_sample = 0
         self.distress_events_since_sample = 0
 
-        self._update_overlay_text(
-            elapsed_seconds,
-            population,
-            food_count,
-            carnivore_population,
-            self.ecosystem_stress_index,
-            self.adaptive_mode_active,
-            active_signals=active_signals,
-            relay_events=self.last_sample_relay_events,
-            alert_events=self.last_sample_alert_events,
-        )
-        self._update_graph_surface()
+        if METRICS_HUD_ENABLED:
+            self._update_overlay_text(
+                elapsed_seconds,
+                population,
+                food_count,
+                carnivore_population,
+                self.ecosystem_stress_index,
+                self.adaptive_mode_active,
+                active_signals=active_signals,
+                relay_events=self.last_sample_relay_events,
+                alert_events=self.last_sample_alert_events,
+                steam_special_count=len(self.steam_giants),
+                ssh_special_count=len(self.ssh_wardens),
+            )
+            if METRICS_GRAPH_ENABLED:
+                self._update_graph_surface()
+            else:
+                self.graph_surface = None
 
     def _update_overlay_text(
         self,
@@ -926,14 +1132,22 @@ class Simulation:
         active_signals=0,
         relay_events=0,
         alert_events=0,
+        steam_special_count=0,
+        ssh_special_count=0,
     ):
+        if not METRICS_HUD_ENABLED or self.overlay_font is None:
+            self.overlay_text_surface = None
+            self.overlay_bg_surface = None
+            return
+
         runtime_text = time.strftime("%H:%M:%S", time.gmtime(elapsed_seconds))
         adaptive_label = "ON" if adaptive_mode else "OFF"
         comm_debug_label = "ON" if self.communication_debug_draw else "OFF"
         overlay_text = (
             f"{runtime_text} | Prey: {population} | Pred: {carnivore_count} | "
             f"Food: {food_count} | Sig: {active_signals} | Relay: {relay_events} | "
-            f"Alert: {alert_events} | Stress: {ecosystem_stress:.2f} | Aid: {adaptive_label} | ComDbg: {comm_debug_label}"
+            f"Alert: {alert_events} | Steam: {steam_special_count} | SSH: {ssh_special_count} | "
+            f"Stress: {ecosystem_stress:.2f} | Aid: {adaptive_label} | ComDbg: {comm_debug_label}"
         )
         self.overlay_text_surface = self.overlay_font.render(overlay_text, True, OVERLAY_TEXT_COLOR)
         self.overlay_bg_surface = pygame.Surface(
@@ -1018,6 +1232,10 @@ class Simulation:
         pygame.draw.circle(surface, color, (int(end_x), int(end_y)), 3)
 
     def _update_graph_surface(self):
+        if not METRICS_HUD_ENABLED or not METRICS_GRAPH_ENABLED:
+            self.graph_surface = None
+            return
+
         panel_width, panel_height = GRAPH_PANEL_SIZE
         self.graph_surface = pygame.Surface((panel_width, panel_height), pygame.SRCALPHA)
         panel_rect = self.graph_surface.get_rect()
@@ -1085,6 +1303,9 @@ class Simulation:
         self.graph_surface.blit(stress_legend, (202, panel_height - 18))
 
     def _draw_overlay(self):
+        if not METRICS_HUD_ENABLED:
+            return
+
         if self.overlay_text_surface is None or self.overlay_bg_surface is None:
             return
 
@@ -1111,6 +1332,8 @@ class Simulation:
                 else:
                     scene_surface.fill(BG_COLOR)
 
+                self._sync_special_entities_from_presence()
+
                 for event in pygame.event.get():
                     if event.type == pygame.QUIT:
                         self.running = False
@@ -1127,11 +1350,24 @@ class Simulation:
                 for food in self.foods:
                     food.draw(scene_surface)
 
+                for steam_giant in self.steam_giants:
+                    steam_giant.update()
+
+                for ssh_warden in self.ssh_wardens:
+                    ssh_warden.update()
+
+                for steam_giant in self.steam_giants:
+                    steam_giant.draw(scene_surface)
+
+                for ssh_warden in self.ssh_wardens:
+                    ssh_warden.draw(scene_surface)
+
                 new_motes = []
                 alive_motes = []
                 new_carnivores = []
                 alive_carnivores = []
                 consumed_mote_ids = set()
+                consumed_food_ids = set()
 
                 if ENABLE_PREDATORS:
                     for carnivore in self.carnivores:
@@ -1149,16 +1385,18 @@ class Simulation:
                             continue
 
                         colliding_mote = None
-                        closest_dist = float("inf")
+                        closest_dist_sq = float("inf")
                         for mote in self.motes:
                             mote_id = id(mote)
                             if mote_id in consumed_mote_ids:
                                 continue
 
-                            dist = math.hypot(mote.x - carnivore.x, mote.y - carnivore.y)
+                            dx = mote.x - carnivore.x
+                            dy = mote.y - carnivore.y
+                            dist_sq = (dx * dx) + (dy * dy)
                             attack_reach = carnivore.radius + mote.radius + CARNIVORE_ATTACK_REACH_BONUS
-                            if dist < attack_reach and dist < closest_dist:
-                                closest_dist = dist
+                            if dist_sq < (attack_reach * attack_reach) and dist_sq < closest_dist_sq:
+                                closest_dist_sq = dist_sq
                                 colliding_mote = mote
 
                         if colliding_mote is not None:
@@ -1228,17 +1466,27 @@ class Simulation:
                         self._interrupt_entity_mating(mote, failed=True)
                         continue
 
-                    for food in self.foods[:]:
+                    for food in self.foods:
+                        food_id = id(food)
+                        if food_id in consumed_food_ids:
+                            continue
+
                         if not food.is_grown():
                             continue
 
-                        dist = math.hypot(food.x - mote.x, food.y - mote.y)
-                        if dist < mote.radius + food.radius:
+                        dx = food.x - mote.x
+                        dy = food.y - mote.y
+                        dist_sq = (dx * dx) + (dy * dy)
+                        eat_reach = mote.radius + food.radius
+                        if dist_sq < (eat_reach * eat_reach):
                             mote.energy += food.energy_value
-                            self.foods.remove(food)
+                            consumed_food_ids.add(food_id)
 
                     alive_motes.append(mote)
                     mote.draw(scene_surface)
+
+                if consumed_food_ids:
+                    self.foods = [food for food in self.foods if id(food) not in consumed_food_ids]
 
                 if SEXUAL_REPRODUCTION_ENABLED:
                     new_motes.extend(self._update_species_mating(alive_motes, "prey"))
@@ -1264,9 +1512,13 @@ class Simulation:
                 if self.frame_count % METRICS_SAMPLE_FRAMES == 0:
                     self._collect_and_log_metrics()
 
-                self._draw_overlay()
+                if METRICS_HUD_ENABLED:
+                    self._draw_overlay()
                 pygame.display.flip()
                 self.clock.tick(FPS)
         finally:
+            self._presence_stop_event.set()
+            if self._presence_thread is not None:
+                self._presence_thread.join(timeout=2.0)
             self.metrics_logger.stop()
             pygame.quit()

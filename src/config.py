@@ -2,6 +2,39 @@ import os
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
+
+def _load_env_fallback(env_path):
+	if not os.path.isfile(env_path):
+		return
+
+	with open(env_path, encoding="utf-8") as env_file:
+		for raw_line in env_file:
+			line = raw_line.strip()
+			if not line or line.startswith("#"):
+				continue
+
+			if line.startswith("export "):
+				line = line[7:].strip()
+
+			if "=" not in line:
+				continue
+
+			key, value = line.split("=", 1)
+			key = key.strip()
+			if not key:
+				continue
+
+			os.environ.setdefault(key, value.strip().strip('"').strip("'"))
+
+
+_DOTENV_PATH = os.path.join(PROJECT_ROOT, ".env")
+try:
+	from dotenv import load_dotenv
+except ImportError:
+	_load_env_fallback(_DOTENV_PATH)
+else:
+	load_dotenv(_DOTENV_PATH, override=False)
+
 # --- CONFIGURATION & BALANCE ---
 WIDTH, HEIGHT = 960, 640
 FPS = 60
@@ -104,6 +137,10 @@ METRICS_QUEUE_SIZE = 256
 METRICS_MAX_FILE_BYTES = 900 * 1024 * 1024
 METRICS_RESET_ON_START = True
 
+# Disable HUD/graph by default to save CPU/GPU on Raspberry Pi.
+METRICS_HUD_ENABLED = False
+METRICS_GRAPH_ENABLED = False
+
 OVERLAY_BG_COLOR = (0, 0, 0, 130)
 OVERLAY_TEXT_COLOR = (230, 230, 230)
 OVERLAY_POS = (10, 10)
@@ -128,6 +165,8 @@ GRAPH_STRESS_COLOR = (166, 132, 255)
 
 MOTE_SPRITESHEET_PATH = os.path.join("resources", "coccinelle_spritesheet.png")
 CARNIVORE_SPRITESHEET_PATH = os.path.join("resources", "mechant_spritesheet.png")
+STEAM_ENTITY_SPRITESHEET_PATH = os.path.join("resources", "steam", "steam_spritesheet.png")
+SSH_ENTITY_SPRITESHEET_PATH = os.path.join("resources", "ssh", "ssh_spritesheet.png")
 BACKGROUND_TEXTURE_PATH = os.path.join("resources", "grass.png")
 PREY_SPRITES_DIR = os.path.join("resources", "prey")
 CROP_SPRITES_DIR = os.path.join("resources", "crops")
@@ -240,9 +279,46 @@ CAMERA_MIN_ZOOM = 1.0
 CAMERA_MAX_ZOOM = 1.80
 CAMERA_FOLLOW_LERP = 0.06
 CAMERA_ZOOM_LERP = 0.045
-CAMERA_USE_SMOOTHSCALE = True
+CAMERA_USE_SMOOTHSCALE = False
 
-PHEROMONE_DEBUG_DRAW_DEFAULT = True
+PHEROMONE_DEBUG_DRAW_DEFAULT = False
 PHEROMONE_DEBUG_ALPHA = 80
 PHEROMONE_DEBUG_RADIUS_MIN = 6
 PHEROMONE_DEBUG_RADIUS_SCALE = 18
+
+ENABLE_STEAM_ENTITY = True
+ENABLE_SSH_ENTITY = True
+INITIAL_STEAM_ENTITY_COUNT = 0
+INITIAL_SSH_ENTITY_COUNT = 0
+
+PRESENCE_POLLING_ENABLED = True
+PRESENCE_THREAD_SLEEP_SECONDS = 0.25
+STEAM_API_KEY = os.environ.get("STEAM_API_KEY", "").strip()
+STEAM_ID64 = os.environ.get("STEAM_ID64", "").strip()
+STEAM_POLL_INTERVAL_SECONDS = 20.0
+STEAM_REQUEST_TIMEOUT_SECONDS = 10.0
+SSH_POLL_INTERVAL_SECONDS = 5.0
+SSH_ENTITY_MAX_COUNT = 4
+
+STEAM_ENTITY_BASE_SIZE = 3.2
+STEAM_ENTITY_BASE_SPEED = 0.42
+STEAM_ENTITY_RADIUS_BASE = 8
+STEAM_ENTITY_RADIUS_SCALE = 3.1
+STEAM_ENTITY_TURN_FACTOR = 0.045
+STEAM_ENTITY_WANDER_JITTER = 0.08
+STEAM_ENTITY_PAUSE_CHANCE = 0.004
+STEAM_ENTITY_PAUSE_FRAMES_MIN = int(FPS * 0.4)
+STEAM_ENTITY_PAUSE_FRAMES_MAX = int(FPS * 1.4)
+STEAM_ENTITY_MIN_SPRITE_SIZE_PX = 56
+STEAM_ENTITY_SPRITE_HEADING_OFFSET_DEGREES = -90.0
+
+SSH_ENTITY_BASE_SIZE = 2.25
+SSH_ENTITY_BASE_SPEED = 0.72
+SSH_ENTITY_RADIUS_BASE = 7
+SSH_ENTITY_RADIUS_SCALE = 2.5
+SSH_ENTITY_TURN_FACTOR = 0.068
+SSH_ENTITY_WANDER_JITTER = 0.12
+SSH_ENTITY_EDGE_MARGIN = 72.0
+SSH_ENTITY_EDGE_PULL = 0.55
+SSH_ENTITY_MIN_SPRITE_SIZE_PX = 40
+SSH_ENTITY_SPRITE_HEADING_OFFSET_DEGREES = -90.0
