@@ -49,6 +49,21 @@ from src.config import (
     REPRO_MATING_RING_WIDTH,
     REPRO_RING_OFFSET,
     REPRO_SEEK_RING_WIDTH,
+    SAFENESS_ALIGNMENT_WEIGHT,
+    SAFENESS_ALLY_RADIUS,
+    SAFENESS_ANCHOR_RADIUS,
+    SAFENESS_BASELINE,
+    SAFENESS_COHESION_WEIGHT,
+    SAFENESS_GROUP_INFLUENCE_MAX,
+    SAFENESS_GROUP_INFLUENCE_MIN,
+    SAFENESS_GROUPING_ENABLED,
+    SAFENESS_JOIN_THRESHOLD,
+    SAFENESS_LEAVE_THRESHOLD,
+    SAFENESS_NEARBY_ALLY_SCALE,
+    SAFENESS_PHEROMONE_WEIGHT,
+    SAFENESS_SEPARATION_RADIUS,
+    SAFENESS_SEPARATION_WEIGHT,
+    SAFENESS_THREAT_WEIGHT,
     SEXUAL_REPRODUCTION_ENABLED,
     SPRITE_ANIMATION_FRAME_MS,
     SPRITE_MOVING_SPEED_THRESHOLD,
@@ -119,6 +134,8 @@ class Mote:
         self.reproduction_cooldown_frames = PREY_REPRODUCTION_COOLDOWN_FRAMES
         self.failed_mating_cooldown_frames = PREY_FAILED_MATING_COOLDOWN_FRAMES
         self.mating_energy_cost = PREY_MATE_ENERGY_COST
+        self.safeness_score = 0.0
+        self.in_group = False
 
     def _radius_from_size(self, size):
         return max(3, int(PREY_RADIUS_BASE + (size * PREY_RADIUS_SCALE)))
@@ -328,8 +345,139 @@ class Mote:
 
         return steer_x / magnitude, steer_y / magnitude, min(1.0, strongest_threat)
 
+    def _compute_safeness_score(self, threat_level, pheromone_level, nearby_motes):
+        ally_count = 0
+        radius_sq = SAFENESS_ALLY_RADIUS * SAFENESS_ALLY_RADIUS
+
+        if nearby_motes:
+            for mote in nearby_motes:
+                if mote is self or mote.energy <= 0:
+                    continue
+                dx = mote.x - self.x
+                dy = mote.y - self.y
+                if (dx * dx) + (dy * dy) <= radius_sq:
+                    ally_count += 1
+
+        ally_bonus = min(1.0, ally_count * SAFENESS_NEARBY_ALLY_SCALE)
+        raw_score = SAFENESS_BASELINE + ally_bonus
+        raw_score -= threat_level * SAFENESS_THREAT_WEIGHT
+        raw_score -= pheromone_level * SAFENESS_PHEROMONE_WEIGHT
+
+        return max(0.0, min(1.0, raw_score))
+
+    def _get_safest_anchor(self, nearby_motes):
+        if not nearby_motes:
+            return None
+
+        threshold = SAFENESS_LEAVE_THRESHOLD if self.in_group else SAFENESS_JOIN_THRESHOLD
+        best_anchor = None
+        best_score = threshold
+        best_dist_sq = float("inf")
+        radius_sq = SAFENESS_ANCHOR_RADIUS * SAFENESS_ANCHOR_RADIUS
+
+        for mote in nearby_motes:
+            if mote is self or mote.energy <= 0:
+                continue
+
+            if getattr(mote, "reproduction_state", "IDLE") == "MATING":
+                continue
+
+            dx = mote.x - self.x
+            dy = mote.y - self.y
+            dist_sq = (dx * dx) + (dy * dy)
+            if dist_sq <= 1e-6 or dist_sq > radius_sq:
+                continue
+
+            candidate_score = getattr(mote, "safeness_score", 0.0)
+            if candidate_score < threshold:
+                continue
+
+            if candidate_score > best_score or (candidate_score == best_score and dist_sq < best_dist_sq):
+                best_anchor = mote
+                best_score = candidate_score
+                best_dist_sq = dist_sq
+
+        return best_anchor
+
+    def _compute_group_vector(self, anchor, nearby_motes):
+        if anchor is None:
+            return 0.0, 0.0
+
+        cohesion_x = anchor.x - self.x
+        cohesion_y = anchor.y - self.y
+        cohesion_mag = math.hypot(cohesion_x, cohesion_y)
+        if cohesion_mag > 1e-6:
+            cohesion_x /= cohesion_mag
+            cohesion_y /= cohesion_mag
+        else:
+            cohesion_x = 0.0
+            cohesion_y = 0.0
+
+        alignment_x = 0.0
+        alignment_y = 0.0
+        alignment_count = 0
+        ally_radius_sq = SAFENESS_ALLY_RADIUS * SAFENESS_ALLY_RADIUS
+        for mote in nearby_motes or []:
+            if mote is self or mote.energy <= 0:
+                continue
+            dx = mote.x - self.x
+            dy = mote.y - self.y
+            if (dx * dx) + (dy * dy) > ally_radius_sq:
+                continue
+
+            neighbor_speed = math.hypot(mote.vx, mote.vy)
+            if neighbor_speed <= 1e-6:
+                continue
+
+            alignment_x += mote.vx / neighbor_speed
+            alignment_y += mote.vy / neighbor_speed
+            alignment_count += 1
+
+        if alignment_count > 0:
+            alignment_x /= alignment_count
+            alignment_y /= alignment_count
+            alignment_mag = math.hypot(alignment_x, alignment_y)
+            if alignment_mag > 1e-6:
+                alignment_x /= alignment_mag
+                alignment_y /= alignment_mag
+
+        separation_x = 0.0
+        separation_y = 0.0
+        separation_radius_sq = SAFENESS_SEPARATION_RADIUS * SAFENESS_SEPARATION_RADIUS
+        for mote in nearby_motes or []:
+            if mote is self or mote.energy <= 0:
+                continue
+            dx = self.x - mote.x
+            dy = self.y - mote.y
+            dist_sq = (dx * dx) + (dy * dy)
+            if dist_sq <= 1e-6 or dist_sq > separation_radius_sq:
+                continue
+
+            dist = math.sqrt(dist_sq)
+            proximity = max(0.0, 1.0 - (dist / SAFENESS_SEPARATION_RADIUS))
+            separation_x += (dx / dist) * proximity
+            separation_y += (dy / dist) * proximity
+
+        separation_mag = math.hypot(separation_x, separation_y)
+        if separation_mag > 1e-6:
+            separation_x /= separation_mag
+            separation_y /= separation_mag
+
+        steer_x = (cohesion_x * SAFENESS_COHESION_WEIGHT) + (alignment_x * SAFENESS_ALIGNMENT_WEIGHT)
+        steer_y = (cohesion_y * SAFENESS_COHESION_WEIGHT) + (alignment_y * SAFENESS_ALIGNMENT_WEIGHT)
+        steer_x += separation_x * SAFENESS_SEPARATION_WEIGHT
+        steer_y += separation_y * SAFENESS_SEPARATION_WEIGHT
+
+        steer_mag = math.hypot(steer_x, steer_y)
+        if steer_mag <= 1e-6:
+            return 0.0, 0.0
+
+        return steer_x / steer_mag, steer_y / steer_mag
+
     def update(self, foods, carnivores=None, pheromone_field=None, nearby_motes=None):
         movement_speed = self.get_movement_speed()
+        self.in_group = False
+        self.safeness_score = 0.0
 
         if self.communication_emit_cooldown_frames > 0:
             self.communication_emit_cooldown_frames -= 1
@@ -384,6 +532,7 @@ class Mote:
             )
 
         combined_threat_level = max(threat_level, pheromone_level * 0.85, relay_signal_level)
+        self.safeness_score = self._compute_safeness_score(threat_level, pheromone_level, nearby_motes)
 
         alarm_emitted, relay_emitted = self._emit_communication(pheromone_field, threat_level, nearby_motes)
 
@@ -478,6 +627,25 @@ class Mote:
             self.wander_angle += random.uniform(-0.2, 0.2)
             desired_vx = math.cos(self.wander_angle) * movement_speed
             desired_vy = math.sin(self.wander_angle) * movement_speed
+
+        if (
+            SAFENESS_GROUPING_ENABLED
+            and combined_threat_level < PREY_FLEE_PRIORITY_THRESHOLD
+            and not reproduction_seek_mode
+        ):
+            anchor = self._get_safest_anchor(nearby_motes)
+            if anchor is not None:
+                group_x, group_y = self._compute_group_vector(anchor, nearby_motes)
+                if math.hypot(group_x, group_y) > 1e-6:
+                    safe_span = max(1e-6, 1.0 - SAFENESS_LEAVE_THRESHOLD)
+                    safe_factor = max(0.0, min(1.0, (self.safeness_score - SAFENESS_LEAVE_THRESHOLD) / safe_span))
+                    influence_range = SAFENESS_GROUP_INFLUENCE_MAX - SAFENESS_GROUP_INFLUENCE_MIN
+                    group_influence = SAFENESS_GROUP_INFLUENCE_MIN + (safe_factor * influence_range)
+                    group_vx = group_x * movement_speed
+                    group_vy = group_y * movement_speed
+                    desired_vx = (desired_vx * (1.0 - group_influence)) + (group_vx * group_influence)
+                    desired_vy = (desired_vy * (1.0 - group_influence)) + (group_vy * group_influence)
+                    self.in_group = True
 
         flee_x = 0.0
         flee_y = 0.0
