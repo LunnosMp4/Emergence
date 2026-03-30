@@ -77,6 +77,7 @@ class Simulation:
         self.camera_target = None
         self.camera_target_species = None
         self.camera_shot_frames_remaining = 0
+        self.camera_consecutive_map_shots = 0
         self.camera_center_x = WIDTH * 0.5
         self.camera_center_y = HEIGHT * 0.5
         self.camera_zoom = CAMERA_MAP_ZOOM
@@ -281,6 +282,7 @@ class Simulation:
             self.camera_target = None
             self.camera_target_species = None
             self.camera_shot_frames_remaining = 0
+            self.camera_consecutive_map_shots = 0
             return
 
         eligible_prey = [
@@ -295,15 +297,31 @@ class Simulation:
             and self._carnivore_age_frames.get(id(carnivore), 0) >= CAMERA_SUBJECT_MIN_AGE_FRAMES
         ]
 
+        if (
+            not force_map
+            and self.camera_consecutive_map_shots >= CAMERA_MAX_CONSECUTIVE_MAP_SHOTS
+            and not eligible_prey
+            and not eligible_predators
+        ):
+            eligible_prey = [mote for mote in self.motes if mote.energy > 0]
+            eligible_predators = [carnivore for carnivore in self.carnivores if carnivore.energy > 0]
+
+        force_subject = (
+            not force_map
+            and self.camera_consecutive_map_shots >= CAMERA_MAX_CONSECUTIVE_MAP_SHOTS
+            and (eligible_prey or eligible_predators)
+        )
+
         should_pick_map = (
             force_map
             or (not eligible_prey and not eligible_predators)
-            or random.random() < CAMERA_MAP_FOCUS_WEIGHT
+            or (not force_subject and random.random() < CAMERA_MAP_FOCUS_WEIGHT)
         )
         if should_pick_map:
             self.camera_mode = "map"
             self.camera_target = None
             self.camera_target_species = None
+            self.camera_consecutive_map_shots += 1
             self.camera_shot_frames_remaining = self._get_camera_shot_duration(
                 CAMERA_MAP_SHOT_MIN_FRAMES,
                 CAMERA_MAP_SHOT_MAX_FRAMES,
@@ -338,6 +356,7 @@ class Simulation:
         self.camera_mode = target_mode
         self.camera_target = target
         self.camera_target_species = target_species
+        self.camera_consecutive_map_shots = 0
         self.camera_shot_frames_remaining = self._get_camera_shot_duration(
             CAMERA_SUBJECT_SHOT_MIN_FRAMES,
             CAMERA_SUBJECT_SHOT_MAX_FRAMES,
